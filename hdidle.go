@@ -1,3 +1,19 @@
+// hd-idle - spin down idle hard disks
+// Copyright (C) 2018  Andoni del Olmo
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 package main
 
 import (
@@ -6,6 +22,7 @@ import (
 	"github.com/adelolmo/hd-idle/io"
 	"github.com/adelolmo/hd-idle/sgio"
 	"log"
+	"math"
 	"os"
 	"time"
 )
@@ -17,7 +34,7 @@ const (
 )
 
 type DefaultConf struct {
-	Idle          int
+	Idle          time.Duration
 	CommandType   string
 	Debug         bool
 	LogFile       string
@@ -27,14 +44,14 @@ type DefaultConf struct {
 type DeviceConf struct {
 	Name        string
 	GivenName   string
-	Idle        int
+	Idle        time.Duration
 	CommandType string
 }
 
 type Config struct {
 	Devices  []DeviceConf
 	Defaults DefaultConf
-	SkewTime uint64
+	SkewTime time.Duration
 }
 
 var previousSnapshots []diskstats.DiskStats
@@ -79,7 +96,7 @@ func updateState(tmp diskstats.DiskStats, config *Config) {
 		return
 	}
 
-	if uint64(now.Sub(lastNow).Seconds()) > config.SkewTime {
+	if now.Sub(lastNow) > config.SkewTime {
 		/* we slept too long, assume a suspend event and disks may be spun up */
 		/* reset spin status and timers */
 		previousSnapshots[dsi].SpinUpAt = now
@@ -92,9 +109,12 @@ func updateState(tmp diskstats.DiskStats, config *Config) {
 	if ds.Writes == tmp.Writes && ds.Reads == tmp.Reads {
 		if !ds.SpunDown {
 			/* no activity on this disk and still running */
-			idleDuration := int(now.Sub(ds.LastIoAt).Seconds())
+			idleDuration := now.Sub(ds.LastIoAt)
 			if ds.IdleTime != 0 && idleDuration > ds.IdleTime {
-				spindownDisk(ds.Name, ds.CommandType)
+				device := fmt.Sprintf("/dev/%s", ds.Name)
+				if err := spindownDisk(device, ds.CommandType); err != nil {
+					fmt.Println(err.Error())
+				}
 				previousSnapshots[dsi].SpinDownAt = now
 				previousSnapshots[dsi].SpunDown = true
 			}
@@ -116,12 +136,12 @@ func updateState(tmp diskstats.DiskStats, config *Config) {
 
 	if config.Defaults.Debug {
 		ds = previousSnapshots[dsi]
-		idleDuration := int(now.Sub(ds.LastIoAt).Seconds())
+		idleDuration := now.Sub(ds.LastIoAt)
 		fmt.Printf("disk=%s command=%s spunDown=%t "+
-			"reads=%d writes=%d idleTime=%d idleDuration=%d "+
+			"reads=%d writes=%d idleTime=%v idleDuration=%v "+
 			"spindown=%s spinup=%s lastIO=%s\n",
 			ds.Name, ds.CommandType, ds.SpunDown,
-			ds.Reads, ds.Writes, ds.IdleTime, idleDuration,
+			ds.Reads, ds.Writes, ds.IdleTime.Seconds(), math.RoundToEven(idleDuration.Seconds()),
 			ds.SpinDownAt.Format(dateFormat), ds.SpinUpAt.Format(dateFormat), ds.LastIoAt.Format(dateFormat))
 	}
 }
@@ -169,21 +189,21 @@ func deviceConfig(diskName string, config *Config) *DeviceConf {
 	}
 }
 
-func spindownDisk(deviceName, command string) {
-	fmt.Printf("%s spindown\n", deviceName)
-	device := fmt.Sprintf("/dev/%s", deviceName)
+func spindownDisk(device, command string) error {
+	fmt.Printf("%s spindown\n", device)
 	switch command {
 	case SCSI:
 		if err := sgio.StopScsiDevice(device); err != nil {
-			fmt.Printf("cannot spindown scsi disk %s:\n%s\n", device, err.Error())
+			return fmt.Errorf("cannot spindown scsi disk %s:\n%s\n", device, err.Error())
 		}
-		return
+		return nil
 	case ATA:
 		if err := sgio.StopAtaDevice(device); err != nil {
-			fmt.Printf("cannot spindown ata disk %s:\n%s\n", device, err.Error())
+			return fmt.Errorf("cannot spindown ata disk %s:\n%s\n", device, err.Error())
 		}
-		return
+		return nil
 	}
+	return nil
 }
 
 func logSpinup(ds diskstats.DiskStats, file string) {
@@ -194,25 +214,27 @@ func logSpinup(ds diskstats.DiskStats, file string) {
 	logToFile(file, text)
 }
 
-func logSpinupAfterSleep(name string, file string) {
+func logSpinupAfterSleep(name, file string) {
 	text := fmt.Sprintf("date: %s, time: %s, disk: %s, assuming disk spun up after long sleep",
 		now.Format("2006-01-02"), now.Format("15:04:05"), name)
 	logToFile(file, text)
 }
 
-func logToFile(file string, text string) {
-	if len(file) > 0 {
-		cacheFile, err := os.OpenFile(file, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-		if err != nil {
-			log.Fatalf("Cannot open file %s. Error: %s", file, err)
-		}
-		if _, err = cacheFile.WriteString(text + "\n"); err != nil {
-			log.Fatalf("Cannot write into file %s. Error: %s", file, err)
-		}
-		err = cacheFile.Close()
-		if err != nil {
-			log.Fatalf("Cannot close file %s. Error: %s", file, err)
-		}
+func logToFile(file, text string) {
+	if len(file) == 0 {
+		return
+	}
+
+	cacheFile, err := os.OpenFile(file, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Fatalf("Cannot open file %s. Error: %s", file, err)
+	}
+	if _, err = cacheFile.WriteString(text + "\n"); err != nil {
+		log.Fatalf("Cannot write into file %s. Error: %s", file, err)
+	}
+	err = cacheFile.Close()
+	if err != nil {
+		log.Fatalf("Cannot close file %s. Error: %s", file, err)
 	}
 }
 
@@ -221,11 +243,11 @@ func (c *Config) String() string {
 	for _, device := range c.Devices {
 		devices += "{" + device.String() + "}"
 	}
-	return fmt.Sprintf("symlinkPolicy=%d, defaultIdle=%d, defaultCommand=%s, debug=%t, logFile=%s, devices=%s",
-		c.Defaults.SymlinkPolicy, c.Defaults.Idle, c.Defaults.CommandType, c.Defaults.Debug, c.Defaults.LogFile, devices)
+	return fmt.Sprintf("symlinkPolicy=%d, defaultIdle=%v, defaultCommand=%s, debug=%t, logFile=%s, devices=%s",
+		c.Defaults.SymlinkPolicy, c.Defaults.Idle.Seconds(), c.Defaults.CommandType, c.Defaults.Debug, c.Defaults.LogFile, devices)
 }
 
 func (dc *DeviceConf) String() string {
-	return fmt.Sprintf("name=%s, givenName=%s, idle=%d, commandType=%s",
-		dc.Name, dc.GivenName, dc.Idle, dc.CommandType)
+	return fmt.Sprintf("name=%s, givenName=%s, idle=%v, commandType=%s",
+		dc.Name, dc.GivenName, dc.Idle.Seconds(), dc.CommandType)
 }

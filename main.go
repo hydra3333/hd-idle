@@ -1,16 +1,31 @@
+// hd-idle - spin down idle hard disks
+// Copyright (C) 2018  Andoni del Olmo
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 package main
 
 import (
 	"fmt"
 	"github.com/adelolmo/hd-idle/io"
-	"github.com/adelolmo/hd-idle/sgio"
-	"github.com/jasonlvhit/gocron"
 	"os"
 	"strconv"
+	"time"
 )
 
 const (
-	defaultIdleTime     = 600
+	defaultIdleTime     = 600 * time.Second
 	symlinkResolveOnce  = 0
 	symlinkResolveRetry = 1
 )
@@ -22,6 +37,8 @@ func main() {
 		os.Exit(0)
 	}
 
+	singleDiskMode := false
+	var disk string
 	defaultConf := DefaultConf{
 		Idle:          defaultIdleTime,
 		CommandType:   SCSI,
@@ -41,12 +58,8 @@ func main() {
 				fmt.Println("Missing disk argument. Must be a device (e.g. sda)")
 				os.Exit(1)
 			}
-			disk := os.Args[index+2]
-			if err := sgio.StopScsiDevice(disk); err != nil {
-				fmt.Printf("cannot spindown scsi disk %s\n. %s", disk, err.Error())
-				os.Exit(1)
-			}
-			os.Exit(0)
+			singleDiskMode = true
+			disk = os.Args[index+2]
 
 		case "-s":
 			s := os.Args[index+2]
@@ -71,7 +84,6 @@ func main() {
 				deviceRealPath = ""
 				fmt.Printf("Unable to resolve symlink: %s\n", name)
 			}
-			//println("name: " + deviceRealPath + " givenName: " + name)
 			deviceConf = &DeviceConf{
 				Name:        deviceRealPath,
 				GivenName:   name,
@@ -87,10 +99,10 @@ func main() {
 				os.Exit(1)
 			}
 			if deviceConf == nil {
-				config.Defaults.Idle = idle
+				config.Defaults.Idle = time.Duration(idle) * time.Second
 				break
 			}
-			deviceConf.Idle = idle
+			deviceConf.Idle = time.Duration(idle) * time.Second
 
 		case "-c":
 			command := os.Args[index+2]
@@ -119,6 +131,14 @@ func main() {
 		}
 	}
 
+	if singleDiskMode {
+		if err := spindownDisk(disk, config.Defaults.CommandType); err != nil {
+			fmt.Println(err.Error())
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	if deviceConf != nil {
 		config.Devices = append(config.Devices, *deviceConf)
 	}
@@ -126,27 +146,27 @@ func main() {
 
 	interval := poolInterval(config.Devices)
 	config.SkewTime = interval * 3
-	gocron.Every(interval).Seconds().Do(ObserveDiskActivity, config)
-	gocron.NextRun()
-	<-gocron.Start()
+	for {
+		ObserveDiskActivity(config)
+		time.Sleep(interval)
+	}
 }
 
-func poolInterval(deviceConfs []DeviceConf) uint64 {
-	var interval = ^uint64(0)
-
+func poolInterval(deviceConfs []DeviceConf) time.Duration {
 	if len(deviceConfs) == 0 {
 		return defaultIdleTime / 10
 	}
 
+	interval := defaultIdleTime
 	for _, dev := range deviceConfs {
-		if uint64(dev.Idle) < interval {
-			interval = uint64(dev.Idle)
+		if dev.Idle < interval {
+			interval = dev.Idle
 		}
 	}
 
 	sleepTime := interval / 10
 	if sleepTime == 0 {
-		return 1
+		return time.Second
 	}
 	return sleepTime
 }
